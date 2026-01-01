@@ -70,21 +70,28 @@
 
 ## 🔍 Overview
 
-language worker
+LLM-powered translation & language service:
+- Real-time translation via LLM API
+- KV caching for performance
+- Multi-language support
+- Integrated with blog for content localization
 
 ### Why lingua.xaostech.io?
 
-{{WHY_PROJECT}}
+Dedicated **language operations** worker. Handles:
+- Translation requests
+- Language detection
+- Cache management for cost optimization
 
 ---
 
 ## ✨ Features
 
-- 🚀 **Feature 1** - Description of feature 1
-- 🔧 **Feature 2** - Description of feature 2
-- 📦 **Feature 3** - Description of feature 3
-- 🔒 **Feature 4** - Description of feature 4
-- ⚡ **Feature 5** - Description of feature 5
+- 🌍 **Multi-Language** - LLM-powered translation
+- ⚡ **KV Caching** - Avoid redundant LLM calls
+- 🔐 **Auth Required** - Session token verification
+- 💾 **Cache Stats** - Track translation hits/misses
+- 🔒 **Rate Limited** - Per-user translation quotas
 
 ---
 
@@ -92,12 +99,26 @@ language worker
 
 ### Prerequisites
 
-- {{PREREQUISITE_1}}
-- {{PREREQUISITE_2}}
-- {{PREREQUISITE_3}}
+- Node.js 18+
+- Cloudflare account with Workers
+- KV namespace for caching
+- LLM API key (stored as Worker Secret)
 
 ### Quick Start
 
+```bash
+# Clone the repository
+git clone https://github.com/XAOSTECH/lingua.xaostech.io.git
+cd lingua.xaostech.io
+
+# Install dependencies
+npm install
+
+# Local development
+npm run dev
+
+# Deploy to production
+npm run deploy
 ```bash
 # Clone the repository
 git clone https://github.com/XAOSTECH/lingua.xaostech.io.git

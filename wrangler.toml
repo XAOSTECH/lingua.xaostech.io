@@ -1,24 +1,26 @@
 name = "xaostech-lingua"
 compatibility_date = "2025-12-31"
 main = "src/index.js"
-
-[[kv_namespaces]]
-binding = "TRANSLATIONS_KV"
-
-[[kv_namespaces]]
-binding = "CACHE_KV"
-
-[vars]
-CACHE_TTL_SECONDS = "86400"
-OPENAI_MODEL = "gpt-4o-mini"
+send_metrics = false
 
 [env.production]
 routes = [{ pattern = "lingua.xaostech.io/*", zone_name = "xaostech.io" }]
 
+[env.production.vars]
+CACHE_TTL_SECONDS = "86400"
+OPENAI_MODEL = "gpt-4o-mini"
+
 [[env.production.kv_namespaces]]
 binding = "TRANSLATIONS_KV"
-id = ""
+id = "${KV_TRANSLATIONS_ID}"
 
 [[env.production.kv_namespaces]]
 binding = "CACHE_KV"
-id = ""
+id = "${KV_CACHE_ID}"
+
+[env.testing]
+routes = [{ pattern = "lingua.testing.local/*", zone_name = "localhost" }]
+
+[env.testing.vars]
+CACHE_TTL_SECONDS = "86400"
+OPENAI_MODEL = "gpt-4o-mini"

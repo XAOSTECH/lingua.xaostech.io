@@ -18,6 +18,10 @@ id = "${KV_TRANSLATIONS_ID}"
 binding = "CACHE_KV"
 id = "${KV_CACHE_ID}"
 
+[[env.production.r2_buckets]]
+binding = "IMG"
+bucket_name = "img"
+
 [env.testing]
 routes = [{ pattern = "lingua.testing.local/*", zone_name = "localhost" }]
 

@@ -146,6 +146,8 @@ function cleanWikiMarkup(text: string): string {
         .replace(/\{\{[^}]+\}\}/g, '')
         // Remove HTML tags
         .replace(/<[^>]+>/g, '')
+        // Remove any remaining angle brackets to prevent tag/script injection
+        .replace(/[<>]/g, '')
         // Clean up extra whitespace
         .replace(/\s+/g, ' ')
         .trim();

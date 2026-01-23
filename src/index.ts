@@ -2,13 +2,28 @@ import { Hono } from 'hono';
 import { createApiProxyRoute } from '../shared/types/api-proxy-hono';
 import { serveFaviconHono } from '../shared/types/favicon';
 import { applySecurityHeaders } from '../shared/types/security';
+import {
+  lookupWord,
+  translateWord,
+  translateWords,
+  getSupportedLanguages,
+  getDictionaryStats,
+  getEtymology as getDictEtymology,
+  CORE_DICTIONARY,
+  type TranslationResult,
+} from './lib/dictionary';
+import { getFullEtymology, getDefinitions } from './lib/etymology';
+
+// Cloudflare AI model IDs
+const CF_TRANSLATION_MODEL = '@cf/meta/m2m100-1.2b';
+const CF_TEXT_MODEL = '@cf/meta/llama-3.3-70b-instruct-fp8-fast';
+const CF_TEXT_MODEL_FAST = '@cf/meta/llama-3.1-8b-instruct-fast';
 
 interface Env {
   TRANSLATIONS_KV: KVNamespace;
   CACHE_KV: KVNamespace;
   CACHE_TTL_SECONDS: string;
-  OPENAI_API_KEY?: string;
-  OPENAI_MODEL: string;
+  AI: Ai; // Cloudflare Workers AI binding
   API_ACCESS_CLIENT_ID?: string;
   API_ACCESS_CLIENT_SECRET?: string;
 }
@@ -26,6 +41,12 @@ interface TranslationResponse {
   from_language: string;
   to_language: string;
   cached: boolean;
+  source?: 'dictionary' | 'cache' | 'api';
+  words?: Array<{
+    original: string;
+    translated: string;
+    hasEtymology: boolean;
+  }>;
 }
 
 const app = new Hono<{ Bindings: Env }>();
@@ -36,14 +57,714 @@ app.use('*', async (c, next) => {
   return applySecurityHeaders(c.res);
 });
 
-// ============ LANDING PAGE ============
+// ============ LANDING PAGE - DUAL PANEL UI ============
 app.get('/', (c) => {
-  const html = '<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>XAOSTECH Lingua - Translation Service</title><link rel="icon" type="image/png" href="/api/data/assets/XAOSTECH_LOGO.png"><style>:root { --primary: #f6821f; --bg: #0a0a0a; --text: #e0e0e0; } * { box-sizing: border-box; margin: 0; padding: 0; } body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: var(--bg); color: var(--text); min-height: 100vh; display: flex; flex-direction: column; align-items: center; padding: 2rem; } .container { max-width: 800px; width: 100%; } h1 { color: var(--primary); } .hero { text-align: center; padding: 3rem 2rem; } .hero h1 { font-size: 2.5rem; } .hero p { font-size: 1.1rem; opacity: 0.8; margin-top: 1rem; } .demo { background: #1a1a1a; border-radius: 12px; padding: 2rem; margin-top: 2rem; } .demo h2 { margin-bottom: 1rem; font-size: 1.25rem; } .demo-row { display: flex; gap: 1rem; margin-bottom: 1rem; flex-wrap: wrap; } .demo textarea { flex: 1; min-width: 200px; background: #0a0a0a; border: 1px solid #333; color: var(--text); padding: 1rem; border-radius: 8px; resize: vertical; min-height: 120px; font-family: inherit; } .demo select { background: #0a0a0a; border: 1px solid #333; color: var(--text); padding: 0.5rem 1rem; border-radius: 6px; } .btn { background: var(--primary); color: #000; padding: 0.75rem 2rem; border: none; border-radius: 6px; cursor: pointer; font-weight: bold; font-size: 1rem; } .btn:hover { opacity: 0.9; } .features { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 1.5rem; margin-top: 3rem; } .feature { background: #1a1a1a; padding: 1.5rem; border-radius: 8px; } .feature h3 { color: var(--primary); margin-bottom: 0.5rem; } .api-example { background: #111; padding: 1rem; border-radius: 6px; font-family: monospace; font-size: 0.85rem; overflow-x: auto; margin-top: 2rem; } footer { margin-top: 4rem; opacity: 0.6; font-size: 0.9rem; }</style></head><body><div class="container"><div class="hero"><h1>🌐 XAOSTECH Lingua</h1><p>AI-powered translation service with caching and batch support</p></div><div class="demo"><h2>Try Translation</h2><div class="demo-row"><select id="fromLang"><option value="auto">Auto-detect</option><option value="en">English</option><option value="es">Spanish</option><option value="fr">French</option><option value="de">German</option></select><span style="align-self:center">→</span><select id="toLang"><option value="es">Spanish</option><option value="en">English</option><option value="fr">French</option><option value="de">German</option><option value="ja">Japanese</option></select></div><div class="demo-row"><textarea id="inputText" placeholder="Enter text to translate..."></textarea><textarea id="outputText" placeholder="Translation will appear here..." readonly></textarea></div><button class="btn" onclick="translateText()">Translate</button></div><div class="features"><div class="feature"><h3>30+ Languages</h3><p>Support for major world languages with high accuracy</p></div><div class="feature"><h3>Smart Caching</h3><p>Cached translations for instant repeat requests</p></div><div class="feature"><h3>Batch API</h3><p>Translate up to 50 texts in a single request</p></div><div class="feature"><h3>Context-Aware</h3><p>Provide context for more accurate domain-specific translations</p></div></div><div class="api-example"><strong>API Example:</strong><br>POST /translate<br>{ "text": "Hello world", "to": "es" }<br><br>Response: { "translated": "Hola mundo", "cached": false }</div></div><footer>&copy; 2026 XAOSTECH. All rights reserved.</footer><script>async function translateText() { const text = document.getElementById("inputText").value; const from = document.getElementById("fromLang").value; const to = document.getElementById("toLang").value; if (!text) return; try { const res = await fetch("/translate", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ text, from, to }) }); const data = await res.json(); document.getElementById("outputText").value = data.translated || data.error || "Translation failed"; } catch (e) { document.getElementById("outputText").value = "Error: " + e.message; } }</script></body></html>';
+  const html = `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>XAOSTECH Lingua - Translation & Etymology</title>
+  <link rel="icon" type="image/png" href="/api/data/assets/XAOSTECH_LOGO.png">
+  <style>
+    :root {
+      --primary: #f6821f;
+      --secondary: #3b82f6;
+      --bg: #0a0a0a;
+      --card: #1a1a1a;
+      --border: #333;
+      --text: #e0e0e0;
+      --muted: #888;
+      --success: #22c55e;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      min-height: 100vh;
+      line-height: 1.6;
+    }
+    .container { max-width: 1400px; margin: 0 auto; padding: 1rem 2rem; }
+    
+    /* Header */
+    header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 1rem 0;
+      border-bottom: 1px solid var(--border);
+      margin-bottom: 1.5rem;
+    }
+    .logo {
+      display: flex;
+      align-items: center;
+      gap: 0.75rem;
+    }
+    .logo h1 {
+      color: var(--primary);
+      font-size: 1.5rem;
+    }
+    .logo span { font-size: 1.5rem; }
+    .header-links {
+      display: flex;
+      gap: 1.5rem;
+    }
+    .header-links a {
+      color: var(--muted);
+      text-decoration: none;
+      font-size: 0.9rem;
+    }
+    .header-links a:hover { color: var(--primary); }
+    
+    /* Main Layout - Two Panels */
+    .main-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 1.5rem;
+      min-height: calc(100vh - 200px);
+    }
+    @media (max-width: 900px) {
+      .main-grid {
+        grid-template-columns: 1fr;
+      }
+    }
+    
+    /* Panel Styling */
+    .panel {
+      background: var(--card);
+      border-radius: 12px;
+      border: 1px solid var(--border);
+      overflow: hidden;
+      display: flex;
+      flex-direction: column;
+    }
+    .panel-header {
+      background: linear-gradient(90deg, rgba(246,130,31,0.1) 0%, transparent 100%);
+      padding: 1rem 1.5rem;
+      border-bottom: 1px solid var(--border);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+    .panel-header h2 {
+      font-size: 1.1rem;
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+    }
+    .panel-header h2 span { color: var(--primary); }
+    .panel-body {
+      padding: 1.5rem;
+      flex: 1;
+      overflow-y: auto;
+    }
+    
+    /* Translation Panel */
+    .lang-selector {
+      display: flex;
+      align-items: center;
+      gap: 1rem;
+      margin-bottom: 1rem;
+    }
+    .lang-selector select {
+      flex: 1;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      color: var(--text);
+      padding: 0.6rem 1rem;
+      border-radius: 6px;
+      font-size: 0.95rem;
+    }
+    .lang-selector .swap-btn {
+      background: none;
+      border: 1px solid var(--border);
+      color: var(--muted);
+      padding: 0.5rem;
+      border-radius: 6px;
+      cursor: pointer;
+      font-size: 1.2rem;
+    }
+    .lang-selector .swap-btn:hover { color: var(--primary); border-color: var(--primary); }
+    
+    .text-area {
+      width: 100%;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      color: var(--text);
+      padding: 1rem;
+      border-radius: 8px;
+      resize: vertical;
+      min-height: 150px;
+      font-family: inherit;
+      font-size: 1rem;
+      line-height: 1.6;
+      margin-bottom: 1rem;
+    }
+    .text-area:focus {
+      outline: none;
+      border-color: var(--primary);
+    }
+    
+    .btn {
+      background: var(--primary);
+      color: #000;
+      padding: 0.75rem 1.5rem;
+      border: none;
+      border-radius: 8px;
+      cursor: pointer;
+      font-weight: bold;
+      font-size: 1rem;
+      transition: all 0.2s;
+    }
+    .btn:hover { opacity: 0.9; transform: translateY(-1px); }
+    .btn:disabled { opacity: 0.5; cursor: not-allowed; transform: none; }
+    .btn-row {
+      display: flex;
+      gap: 0.75rem;
+      margin-bottom: 1rem;
+    }
+    .btn-secondary {
+      background: transparent;
+      color: var(--text);
+      border: 1px solid var(--border);
+    }
+    .btn-secondary:hover { border-color: var(--primary); color: var(--primary); }
+    
+    /* Translation Output */
+    .output-area {
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 1rem;
+      min-height: 150px;
+      margin-top: 1rem;
+    }
+    .output-area .label {
+      font-size: 0.8rem;
+      color: var(--muted);
+      margin-bottom: 0.5rem;
+    }
+    .translated-text {
+      font-size: 1.1rem;
+      line-height: 1.8;
+    }
+    .translated-word {
+      cursor: pointer;
+      padding: 2px 4px;
+      border-radius: 4px;
+      transition: background 0.15s;
+      position: relative;
+    }
+    .translated-word:hover {
+      background: rgba(246, 130, 31, 0.2);
+    }
+    .translated-word.has-etymology::after {
+      content: '';
+      position: absolute;
+      bottom: 0;
+      left: 0;
+      right: 0;
+      height: 2px;
+      background: var(--primary);
+      opacity: 0.5;
+    }
+    .translated-word.selected {
+      background: rgba(246, 130, 31, 0.3);
+    }
+    
+    /* Source Indicator */
+    .source-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.25rem;
+      padding: 0.25rem 0.5rem;
+      border-radius: 4px;
+      font-size: 0.75rem;
+      background: rgba(34, 197, 94, 0.2);
+      color: var(--success);
+    }
+    .source-badge.api {
+      background: rgba(59, 130, 246, 0.2);
+      color: var(--secondary);
+    }
+    
+    /* Etymology Panel */
+    .etymology-content {
+      opacity: 0.6;
+      text-align: center;
+      padding: 3rem;
+    }
+    .etymology-content.active {
+      opacity: 1;
+      text-align: left;
+      padding: 0;
+    }
+    
+    .word-title {
+      font-size: 2rem;
+      color: var(--primary);
+      margin-bottom: 0.5rem;
+    }
+    .word-translation {
+      font-size: 1.25rem;
+      color: var(--muted);
+      margin-bottom: 1.5rem;
+    }
+    
+    .etymology-section {
+      margin-bottom: 1.5rem;
+    }
+    .etymology-section h4 {
+      font-size: 0.85rem;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      margin-bottom: 0.5rem;
+    }
+    .etymology-section p {
+      font-size: 1rem;
+    }
+    
+    .cognates-list {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.5rem;
+    }
+    .cognate-tag {
+      background: var(--bg);
+      border: 1px solid var(--border);
+      padding: 0.25rem 0.75rem;
+      border-radius: 20px;
+      font-size: 0.85rem;
+    }
+    .cognate-tag .lang {
+      color: var(--muted);
+      font-size: 0.75rem;
+    }
+    
+    /* Hover Tooltip */
+    .word-tooltip {
+      position: absolute;
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 0.75rem 1rem;
+      box-shadow: 0 4px 12px rgba(0,0,0,0.5);
+      z-index: 1000;
+      max-width: 300px;
+      pointer-events: none;
+      opacity: 0;
+      transform: translateY(5px);
+      transition: opacity 0.15s, transform 0.15s;
+    }
+    .word-tooltip.visible {
+      opacity: 1;
+      transform: translateY(0);
+    }
+    .tooltip-word {
+      font-weight: bold;
+      color: var(--primary);
+    }
+    .tooltip-origin {
+      font-size: 0.85rem;
+      color: var(--muted);
+      margin-top: 0.25rem;
+    }
+    .tooltip-hint {
+      font-size: 0.75rem;
+      color: var(--secondary);
+      margin-top: 0.5rem;
+    }
+    
+    /* Stats Bar */
+    .stats-bar {
+      display: flex;
+      gap: 2rem;
+      padding: 0.75rem 1rem;
+      background: var(--bg);
+      border-radius: 6px;
+      margin-top: 1rem;
+      font-size: 0.85rem;
+    }
+    .stat {
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+    }
+    .stat-value {
+      color: var(--primary);
+      font-weight: bold;
+    }
+    
+    /* Footer */
+    footer {
+      text-align: center;
+      padding: 1.5rem;
+      color: var(--muted);
+      font-size: 0.85rem;
+      border-top: 1px solid var(--border);
+      margin-top: 2rem;
+    }
+    footer a { color: var(--primary); text-decoration: none; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <header>
+      <div class="logo">
+        <span>🌐</span>
+        <h1>XAOSTECH Lingua</h1>
+      </div>
+      <div class="header-links">
+        <a href="/languages">Languages</a>
+        <a href="https://edu.xaostech.io">Learning</a>
+        <a href="https://xaostech.io">XAOSTECH</a>
+      </div>
+    </header>
+    
+    <div class="main-grid">
+      <!-- Translation Panel (Left) -->
+      <div class="panel">
+        <div class="panel-header">
+          <h2><span>📝</span> Translation</h2>
+          <div class="source-badge" id="sourceBadge" style="display:none">
+            <span>⚡</span> <span id="sourceText">Dictionary</span>
+          </div>
+        </div>
+        <div class="panel-body">
+          <div class="lang-selector">
+            <select id="fromLang">
+              <option value="auto">Auto-detect</option>
+              <option value="en" selected>English</option>
+              <option value="es">Spanish</option>
+              <option value="fr">French</option>
+              <option value="de">German</option>
+              <option value="it">Italian</option>
+              <option value="pt">Portuguese</option>
+              <option value="ja">Japanese</option>
+              <option value="zh">Chinese</option>
+              <option value="ko">Korean</option>
+              <option value="ar">Arabic</option>
+              <option value="ru">Russian</option>
+            </select>
+            <button class="swap-btn" onclick="swapLanguages()" title="Swap languages">⇄</button>
+            <select id="toLang">
+              <option value="es" selected>Spanish</option>
+              <option value="en">English</option>
+              <option value="fr">French</option>
+              <option value="de">German</option>
+              <option value="it">Italian</option>
+              <option value="pt">Portuguese</option>
+              <option value="ja">Japanese</option>
+              <option value="zh">Chinese</option>
+              <option value="ko">Korean</option>
+              <option value="ar">Arabic</option>
+              <option value="ru">Russian</option>
+            </select>
+          </div>
+          
+          <textarea id="inputText" class="text-area" placeholder="Enter text to translate..."></textarea>
+          
+          <div class="btn-row">
+            <button class="btn" onclick="translateText()" id="translateBtn">Translate</button>
+            <button class="btn btn-secondary" onclick="clearAll()">Clear</button>
+          </div>
+          
+          <div class="output-area" id="outputArea">
+            <div class="label">Translation</div>
+            <div class="translated-text" id="translatedText">
+              <span style="color: var(--muted)">Translation will appear here. Click any word to see its etymology.</span>
+            </div>
+          </div>
+          
+          <div class="stats-bar">
+            <div class="stat">
+              <span>📚</span>
+              <span class="stat-value" id="dictWords">${Object.keys(CORE_DICTIONARY).length}</span>
+              <span>dictionary words</span>
+            </div>
+            <div class="stat">
+              <span>🌍</span>
+              <span class="stat-value">${getSupportedLanguages().length}</span>
+              <span>languages</span>
+            </div>
+          </div>
+        </div>
+      </div>
+      
+      <!-- Etymology Panel (Right) -->
+      <div class="panel">
+        <div class="panel-header">
+          <h2><span>📖</span> Etymology</h2>
+        </div>
+        <div class="panel-body">
+          <div class="etymology-content" id="etymologyContent">
+            <p style="font-size: 1.25rem">🔍</p>
+            <p style="margin-top: 0.5rem">Click on any translated word<br>to explore its etymology</p>
+          </div>
+        </div>
+      </div>
+    </div>
+    
+    <footer>
+      &copy; 2026 XAOSTECH. All rights reserved. |
+      <a href="https://edu.xaostech.io">EDU Platform</a> |
+      <a href="/health">API Status</a>
+    </footer>
+  </div>
+  
+  <!-- Hover Tooltip -->
+  <div class="word-tooltip" id="wordTooltip">
+    <div class="tooltip-word" id="tooltipWord"></div>
+    <div class="tooltip-origin" id="tooltipOrigin"></div>
+    <div class="tooltip-hint">Click for full etymology →</div>
+  </div>
+  
+  <script>
+    let currentWordData = {};
+    let selectedWord = null;
+    
+    function swapLanguages() {
+      const from = document.getElementById('fromLang');
+      const to = document.getElementById('toLang');
+      if (from.value !== 'auto') {
+        [from.value, to.value] = [to.value, from.value];
+      }
+    }
+    
+    function clearAll() {
+      document.getElementById('inputText').value = '';
+      document.getElementById('translatedText').innerHTML = '<span style="color: var(--muted)">Translation will appear here. Click any word to see its etymology.</span>';
+      document.getElementById('etymologyContent').innerHTML = '<p style="font-size: 1.25rem">🔍</p><p style="margin-top: 0.5rem">Click on any translated word<br>to explore its etymology</p>';
+      document.getElementById('etymologyContent').classList.remove('active');
+      document.getElementById('sourceBadge').style.display = 'none';
+      currentWordData = {};
+      selectedWord = null;
+    }
+    
+    async function translateText() {
+      const text = document.getElementById('inputText').value.trim();
+      const from = document.getElementById('fromLang').value;
+      const to = document.getElementById('toLang').value;
+      
+      if (!text) return;
+      
+      const btn = document.getElementById('translateBtn');
+      btn.disabled = true;
+      btn.textContent = 'Translating...';
+      
+      try {
+        const res = await fetch('/translate', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ text, from, to })
+        });
+        const data = await res.json();
+        
+        if (data.error) {
+          document.getElementById('translatedText').innerHTML = '<span style="color: #ef4444">' + data.error + '</span>';
+          return;
+        }
+        
+        // Display translated text with clickable words
+        displayTranslation(data);
+        
+        // Show source badge
+        const sourceBadge = document.getElementById('sourceBadge');
+        const sourceText = document.getElementById('sourceText');
+        sourceBadge.style.display = 'inline-flex';
+        
+        if (data.source === 'dictionary') {
+          sourceText.textContent = 'Dictionary (instant)';
+          sourceBadge.className = 'source-badge';
+        } else if (data.cached) {
+          sourceText.textContent = 'Cached';
+          sourceBadge.className = 'source-badge';
+        } else {
+          sourceText.textContent = 'AI Translation';
+          sourceBadge.className = 'source-badge api';
+        }
+        
+      } catch (e) {
+        document.getElementById('translatedText').innerHTML = '<span style="color: #ef4444">Error: ' + e.message + '</span>';
+      } finally {
+        btn.disabled = false;
+        btn.textContent = 'Translate';
+      }
+    }
+    
+    function displayTranslation(data) {
+      const container = document.getElementById('translatedText');
+      const translated = data.translated;
+      currentWordData = {};
+      
+      // Store word data if available
+      if (data.words) {
+        for (const w of data.words) {
+          currentWordData[w.translated.toLowerCase()] = {
+            original: w.original,
+            translated: w.translated,
+            hasEtymology: w.hasEtymology
+          };
+        }
+      }
+      
+      // Split into words and wrap each in a span
+      const words = translated.split(/(\s+)/);
+      let html = '';
+      
+      for (const word of words) {
+        if (/\s+/.test(word)) {
+          html += word;
+        } else {
+          const cleanWord = word.replace(/[.,!?;:'"()\\[\\]{}]/g, '').toLowerCase();
+          const wordInfo = currentWordData[cleanWord];
+          const hasEtym = wordInfo?.hasEtymology || false;
+          
+          html += '<span class="translated-word' + (hasEtym ? ' has-etymology' : '') + '" ' +
+                  'data-word="' + cleanWord + '" ' +
+                  'data-original="' + (wordInfo?.original || cleanWord) + '" ' +
+                  'onclick="showEtymology(this)" ' +
+                  'onmouseenter="showTooltip(event, this)" ' +
+                  'onmouseleave="hideTooltip()">' +
+                  word + '</span>';
+        }
+      }
+      
+      container.innerHTML = html;
+    }
+    
+    function showTooltip(event, el) {
+      const word = el.dataset.original || el.dataset.word;
+      const tooltip = document.getElementById('wordTooltip');
+      const tooltipWord = document.getElementById('tooltipWord');
+      const tooltipOrigin = document.getElementById('tooltipOrigin');
+      
+      tooltipWord.textContent = word;
+      tooltipOrigin.textContent = el.classList.contains('has-etymology') 
+        ? 'Etymology available' 
+        : 'Click to search etymology';
+      
+      // Position tooltip
+      const rect = el.getBoundingClientRect();
+      tooltip.style.left = rect.left + 'px';
+      tooltip.style.top = (rect.bottom + 8) + 'px';
+      tooltip.classList.add('visible');
+    }
+    
+    function hideTooltip() {
+      document.getElementById('wordTooltip').classList.remove('visible');
+    }
+    
+    async function showEtymology(el) {
+      // Remove selected class from previous
+      document.querySelectorAll('.translated-word.selected').forEach(w => w.classList.remove('selected'));
+      el.classList.add('selected');
+      
+      const word = el.dataset.original || el.dataset.word;
+      const container = document.getElementById('etymologyContent');
+      
+      container.innerHTML = '<p style="text-align: center; color: var(--muted)">Loading etymology...</p>';
+      container.classList.add('active');
+      
+      try {
+        const res = await fetch('/etymology', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ word, language: 'en' })
+        });
+        const data = await res.json();
+        
+        displayEtymology(word, el.textContent, data);
+      } catch (e) {
+        container.innerHTML = '<p style="color: #ef4444">Failed to load etymology: ' + e.message + '</p>';
+      }
+    }
+    
+    function displayEtymology(word, translation, data) {
+      const container = document.getElementById('etymologyContent');
+      
+      let html = '<div class="word-title">' + word + '</div>';
+      html += '<div class="word-translation">→ ' + translation + '</div>';
+      
+      // Origin
+      if (data.origin || data.etymology?.origin) {
+        html += '<div class="etymology-section">';
+        html += '<h4>Origin</h4>';
+        html += '<p>' + (data.origin || data.etymology?.origin || 'Unknown') + '</p>';
+        html += '</div>';
+      }
+      
+      // Original Form
+      if (data.originalForm || data.etymology?.originalForm) {
+        html += '<div class="etymology-section">';
+        html += '<h4>Original Form</h4>';
+        html += '<p><em>' + (data.originalForm || data.etymology?.originalForm) + '</em>';
+        if (data.meaning || data.etymology?.meaning) {
+          html += ' - "' + (data.meaning || data.etymology?.meaning) + '"';
+        }
+        html += '</p></div>';
+      }
+      
+      // Root
+      if (data.root || data.etymology?.root) {
+        html += '<div class="etymology-section">';
+        html += '<h4>Root</h4>';
+        html += '<p>*' + (data.root || data.etymology?.root);
+        if (data.rootLanguage || data.etymology?.rootLanguage) {
+          html += ' (' + (data.rootLanguage || data.etymology?.rootLanguage) + ')';
+        }
+        html += '</p></div>';
+      }
+      
+      // Cognates
+      const cognates = data.cognates || data.etymology?.cognates;
+      if (cognates && cognates.length > 0) {
+        html += '<div class="etymology-section">';
+        html += '<h4>Cognates</h4>';
+        html += '<div class="cognates-list">';
+        for (const c of cognates) {
+          html += '<span class="cognate-tag">' + c.word + ' <span class="lang">(' + c.language + ')</span></span>';
+        }
+        html += '</div></div>';
+      }
+      
+      // First Use
+      if (data.firstUse || data.firstRecorded || data.etymology?.firstUse) {
+        html += '<div class="etymology-section">';
+        html += '<h4>First Recorded</h4>';
+        html += '<p>' + (data.firstUse || data.firstRecorded || data.etymology?.firstUse) + '</p>';
+        html += '</div>';
+      }
+      
+      // Evolution
+      const evolution = data.evolution || data.etymology?.evolution;
+      if (evolution && evolution.length > 0) {
+        html += '<div class="etymology-section">';
+        html += '<h4>Evolution</h4>';
+        html += '<p>' + evolution.join(' → ') + '</p>';
+        html += '</div>';
+      }
+      
+      container.innerHTML = html;
+    }
+    
+    // Handle Enter key in input
+    document.getElementById('inputText').addEventListener('keydown', function(e) {
+      if (e.key === 'Enter' && !e.shiftKey) {
+        e.preventDefault();
+        translateText();
+      }
+    });
+  </script>
+</body>
+</html>`;
   return c.html(html);
 });
 
 // ============ HEALTH CHECK ============
-app.get('/health', (c) => c.json({ status: 'ok', service: 'lingua' }));
+app.get('/health', (c) => c.json({ status: 'ok', service: 'lingua', dictionary_words: Object.keys(CORE_DICTIONARY).length }));
 
 // ============ API PROXY ============
 app.all('/api/*', createApiProxyRoute());
@@ -53,7 +774,7 @@ app.get('/favicon.ico', serveFaviconHono);
 
 // ============ TRANSLATION ENDPOINTS ============
 
-// Translate text
+// Translate text - Now with dictionary fallback
 app.post('/translate', async (c) => {
   try {
     const body = await c.req.json<TranslationRequest>();
@@ -64,10 +785,10 @@ app.post('/translate', async (c) => {
     }
 
     // Normalize inputs
-    const normalizedText = text.trim().substring(0, 5000); // Limit text length
+    const normalizedText = text.trim().substring(0, 5000);
     const cacheKey = `trans:${from}:${to}:${hashString(normalizedText)}`;
 
-    // Check KV cache
+    // 1. Check KV cache first
     const cached = await c.env.CACHE_KV.get(cacheKey);
     if (cached) {
       const result = JSON.parse(cached);
@@ -76,31 +797,96 @@ app.post('/translate', async (c) => {
       });
     }
 
-    // Check if OpenAI is configured
-    const openaiKey = c.env.OPENAI_API_KEY;
-    if (!openaiKey) {
-      // Return stub response for development
-      const stubResult: TranslationResponse = {
+    // 2. Try dictionary-based translation for simple words/phrases
+    const words = normalizedText.toLowerCase().split(/\s+/).filter(w => w.length > 0);
+
+    // Check if ALL words are in dictionary (for short texts)
+    if (words.length <= 10 && (from === 'en' || from === 'auto')) {
+      const { translated, notFound } = translateWords(words, to);
+
+      // If all words found in dictionary, use dictionary translation
+      if (notFound.length === 0 && translated.length === words.length) {
+        const translatedText = translated.map(t => t.translated).join(' ');
+
+        const result: TranslationResponse = {
+          original: normalizedText,
+          translated: translatedText,
+          from_language: from === 'auto' ? 'en' : from,
+          to_language: to,
+          cached: false,
+          source: 'dictionary',
+          words: translated.map(t => ({
+            original: t.original,
+            translated: t.translated,
+            hasEtymology: !!t.etymology,
+          })),
+        };
+
+        // Cache the dictionary result
+        await c.env.CACHE_KV.put(cacheKey, JSON.stringify(result), {
+          expirationTtl: parseInt(c.env.CACHE_TTL_SECONDS) || 86400,
+        });
+
+        return c.json(result, 200, {
+          'X-Cache': 'MISS',
+          'X-Translation-Mode': 'dictionary',
+        });
+      }
+    }
+
+    // 3. Use Cloudflare AI for complex translations (no API key needed)
+    // Try partial dictionary translation for words we know
+    const partialResult = words.map(word => {
+      const dictTranslation = translateWord(word, to);
+      return dictTranslation
+        ? { word, translated: dictTranslation.translated, source: 'dictionary' as const }
+        : { word, translated: word, source: 'unknown' as const };
+    });
+
+    const hasUnknown = partialResult.some(r => r.source === 'unknown');
+    let translatedText: string;
+
+    if (hasUnknown) {
+      // Use CF AI for full translation
+      translatedText = await translateWithCF(c, normalizedText, from, to, context);
+
+      const result: TranslationResponse = {
         original: normalizedText,
-        translated: `[${to.toUpperCase()}] ${normalizedText}`,
+        translated: translatedText,
         from_language: from,
         to_language: to,
         cached: false,
+        source: 'api',
+        words: partialResult.map(r => ({
+          original: r.word,
+          translated: r.translated,
+          hasEtymology: !!getDictEtymology(r.word),
+        })),
       };
 
-      // Cache the stub
-      await c.env.CACHE_KV.put(cacheKey, JSON.stringify(stubResult), {
+      await c.env.CACHE_KV.put(cacheKey, JSON.stringify(result), {
         expirationTtl: parseInt(c.env.CACHE_TTL_SECONDS) || 86400,
       });
 
-      return c.json(stubResult, 200, {
+      return c.json(result, 200, {
         'X-Cache': 'MISS',
-        'X-Translation-Mode': 'stub',
+        'X-Translation-Mode': 'dictionary-partial',
       });
     }
 
-    // Call OpenAI for translation
-    const translation = await translateWithOpenAI(c, normalizedText, from, to, context);
+    // 4. Call OpenAI for full translation
+    const translation = await translateWithCF(c, normalizedText, from, to, context);
+
+    // Build word data for the response
+    const translatedWords = translation.split(/\s+/);
+    const wordData = translatedWords.map((tw, i) => {
+      const originalWord = words[i] || tw;
+      return {
+        original: originalWord,
+        translated: tw,
+        hasEtymology: !!getDictEtymology(originalWord),
+      };
+    });
 
     const result: TranslationResponse = {
       original: normalizedText,
@@ -108,6 +894,8 @@ app.post('/translate', async (c) => {
       from_language: from,
       to_language: to,
       cached: false,
+      source: 'api',
+      words: wordData,
     };
 
     // Cache the result
@@ -141,21 +929,55 @@ app.post('/translate/batch', async (c) => {
       return c.json({ error: 'Maximum 50 texts per batch' }, 400);
     }
 
+    const sourceLanguage = from === 'auto' ? 'en' : from;
+
     const results = await Promise.all(
       texts.map(async (text) => {
-        const cacheKey = `trans:${from}:${to}:${hashString(text.trim())}`;
+        const trimmedText = text.trim().toLowerCase();
+        const cacheKey = `trans:${sourceLanguage}:${to}:${hashString(trimmedText)}`;
         const cached = await c.env.CACHE_KV.get(cacheKey);
 
         if (cached) {
           return { ...JSON.parse(cached), cached: true };
         }
 
-        // For now, return stub translations
+        // Try dictionary lookup first for single words
+        const words = trimmedText.split(/\s+/);
+        let translated: string;
+        let translationSource: 'dictionary' | 'api' | 'stub' = 'stub';
+
+        if (words.length === 1) {
+          // Single word - try dictionary
+          const dictResult = translateWord(trimmedText, to);
+          if (dictResult && dictResult.translated !== trimmedText) {
+            translated = dictResult.translated;
+            translationSource = 'dictionary';
+          } else {
+            // Fall back to CF AI
+            translated = await translateWithCF(c, text, sourceLanguage, to);
+            translationSource = 'api';
+          }
+        } else {
+          // Multiple words - try word-by-word dictionary, then CF AI
+          const dictResults = translateWords(words, to);
+          const allFromDict = dictResults.notFound.length === 0;
+
+          if (allFromDict) {
+            translated = dictResults.translated.map(r => r.translated).join(' ');
+            translationSource = 'dictionary';
+          } else {
+            // Use CF AI for full translation
+            translated = await translateWithCF(c, text, sourceLanguage, to);
+            translationSource = 'api';
+          }
+        }
+
         const result = {
           original: text,
-          translated: `[${to.toUpperCase()}] ${text}`,
-          from_language: from,
+          translated,
+          from_language: sourceLanguage,
           to_language: to,
+          source: translationSource,
           cached: false,
         };
 
@@ -223,45 +1045,139 @@ app.delete('/cache', async (c) => {
 
 // ============ HELPER FUNCTIONS ============
 
-async function translateWithOpenAI(
+// Language code mapping for m2m100 model
+const M2M100_LANG_CODES: Record<string, string> = {
+  en: 'en', es: 'es', fr: 'fr', de: 'de', it: 'it', pt: 'pt',
+  zh: 'zh', ja: 'ja', ko: 'ko', ar: 'ar', ru: 'ru', hi: 'hi',
+  nl: 'nl', pl: 'pl', tr: 'tr', vi: 'vi', th: 'th', id: 'id',
+  cs: 'cs', ro: 'ro', hu: 'hu', el: 'el', sv: 'sv', da: 'da',
+  fi: 'fi', no: 'nb', uk: 'uk', he: 'he', bg: 'bg', hr: 'hr',
+};
+
+async function translateWithCF(
   c: any,
   text: string,
   from: string,
   to: string,
   context?: string
 ): Promise<string> {
-  const apiKey = c.env.OPENAI_API_KEY;
-  const model = c.env.OPENAI_MODEL || 'gpt-4o-mini';
+  // Map language codes for m2m100
+  const sourceLang = M2M100_LANG_CODES[from] || 'en';
+  const targetLang = M2M100_LANG_CODES[to];
 
+  if (!targetLang) {
+    // Fallback to LLM for unsupported language pairs
+    return translateWithCFLLM(c, text, from, to, context);
+  }
+
+  try {
+    // Try m2m100 translation model first (fast, specialized)
+    const result = await c.env.AI.run(CF_TRANSLATION_MODEL, {
+      text,
+      source_lang: sourceLang,
+      target_lang: targetLang,
+    }) as { translated_text: string };
+
+    if (result?.translated_text) {
+      return result.translated_text;
+    }
+  } catch (err) {
+    console.warn('[CF-TRANSLATE] m2m100 failed, falling back to LLM:', err);
+  }
+
+  // Fallback to LLM translation
+  return translateWithCFLLM(c, text, from, to, context);
+}
+
+async function translateWithCFLLM(
+  c: any,
+  text: string,
+  from: string,
+  to: string,
+  context?: string
+): Promise<string> {
   const systemPrompt = context
-    ? `You are a professional translator. Translate the following text from ${from === 'auto' ? 'the detected language' : from} to ${to}. Context: ${context}. Return only the translated text.`
-    : `You are a professional translator. Translate the following text from ${from === 'auto' ? 'the detected language' : from} to ${to}. Return only the translated text.`;
+    ? `You are a professional translator. Translate the following text from ${from === 'auto' ? 'the detected language' : from} to ${to}. Context: ${context}. Return ONLY the translated text, nothing else.`
+    : `You are a professional translator. Translate the following text from ${from === 'auto' ? 'the detected language' : from} to ${to}. Return ONLY the translated text, nothing else.`;
 
-  const response = await fetch('https://api.openai.com/v1/chat/completions', {
-    method: 'POST',
-    headers: {
-      'Authorization': `Bearer ${apiKey}`,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({
-      model,
+  try {
+    // Try fast model first
+    const result = await c.env.AI.run(CF_TEXT_MODEL_FAST, {
       messages: [
         { role: 'system', content: systemPrompt },
         { role: 'user', content: text },
       ],
-      temperature: 0.3,
       max_tokens: 2000,
-    }),
-  });
+      temperature: 0.3,
+    }) as { response?: string };
 
-  if (!response.ok) {
-    const err = await response.json();
-    console.error('[OPENAI] Error:', err);
-    throw new Error('OpenAI translation failed');
+    if (result?.response) {
+      return result.response.trim();
+    }
+  } catch (err) {
+    console.warn('[CF-LLM] Fast model failed, trying primary:', err);
   }
 
-  const result = await response.json() as any;
-  return result.choices[0]?.message?.content?.trim() || text;
+  // Fallback to primary model
+  const result = await c.env.AI.run(CF_TEXT_MODEL, {
+    messages: [
+      { role: 'system', content: systemPrompt },
+      { role: 'user', content: text },
+    ],
+    max_tokens: 2000,
+    temperature: 0.3,
+  }) as { response?: string };
+
+  return result?.response?.trim() || text;
+}
+
+/**
+ * Call CF AI for JSON structured output
+ */
+async function callCFAIForJSON(
+  c: any,
+  systemPrompt: string,
+  userPrompt: string
+): Promise<any> {
+  try {
+    // Try fast model first
+    const result = await c.env.AI.run(CF_TEXT_MODEL_FAST, {
+      messages: [
+        { role: 'system', content: systemPrompt + '\n\nReturn ONLY valid JSON, no markdown code blocks.' },
+        { role: 'user', content: userPrompt },
+      ],
+      max_tokens: 2000,
+      temperature: 0.2,
+    }) as { response?: string };
+
+    if (result?.response) {
+      const cleaned = result.response.trim().replace(/```json\n?|\n?```/g, '');
+      return JSON.parse(cleaned);
+    }
+  } catch (err) {
+    console.warn('[CF-AI-JSON] Fast model failed:', err);
+  }
+
+  // Fallback to primary model
+  try {
+    const result = await c.env.AI.run(CF_TEXT_MODEL, {
+      messages: [
+        { role: 'system', content: systemPrompt + '\n\nReturn ONLY valid JSON, no markdown code blocks.' },
+        { role: 'user', content: userPrompt },
+      ],
+      max_tokens: 2000,
+      temperature: 0.2,
+    }) as { response?: string };
+
+    if (result?.response) {
+      const cleaned = result.response.trim().replace(/```json\n?|\n?```/g, '');
+      return JSON.parse(cleaned);
+    }
+  } catch (err) {
+    console.warn('[CF-AI-JSON] Primary model failed:', err);
+  }
+
+  return null;
 }
 
 function hashString(str: string): string {
@@ -334,7 +1250,7 @@ const SUPPORTED_LANGUAGES = [
 
 // ============ EDUCATIONAL ENDPOINTS ============
 
-// Etymology lookup - traces word origins
+// Etymology lookup - traces word origins using Wiktionary + AI fallback
 app.post('/etymology', async (c) => {
   try {
     const { word, language = 'en' } = await c.req.json<{ word: string; language?: string }>();
@@ -343,79 +1259,15 @@ app.post('/etymology', async (c) => {
       return c.json({ error: 'word required' }, 400);
     }
 
-    const cacheKey = `etym:${language}:${hashString(word)}`;
-    const cached = await c.env.CACHE_KV.get(cacheKey);
-
-    if (cached) {
-      return c.json({ ...JSON.parse(cached), cached: true });
-    }
-
-    const openaiKey = c.env.OPENAI_API_KEY;
-    if (!openaiKey) {
-      // Stub response for development
-      return c.json({
-        word,
-        language,
-        etymology: `[Etymology for "${word}" - configure OpenAI for real data]`,
-        roots: [],
-        cognates: [],
-        cached: false,
-      });
-    }
-
-    const response = await fetch('https://api.openai.com/v1/chat/completions', {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${openaiKey}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        model: c.env.OPENAI_MODEL || 'gpt-4o-mini',
-        messages: [
-          {
-            role: 'system',
-            content: `You are an expert etymologist. Provide detailed word etymology in JSON format:
-{
-  "origin": "language of origin",
-  "originalForm": "word in original language",
-  "meaning": "original meaning",
-  "evolution": ["stage1", "stage2", "..."],
-  "roots": [{"root": "root word", "meaning": "meaning", "language": "lang"}],
-  "cognates": [{"word": "word", "language": "lang", "meaning": "meaning"}],
-  "firstRecorded": "approximate date/period",
-  "relatedWords": ["word1", "word2"]
-}
-Return only valid JSON.`,
-          },
-          { role: 'user', content: `Provide etymology for the ${language} word: "${word}"` },
-        ],
-        temperature: 0.3,
-        max_tokens: 1500,
-      }),
-    });
-
-    const result = await response.json() as any;
-    const etymologyText = result.choices[0]?.message?.content?.trim() || '{}';
-
-    let etymology;
-    try {
-      etymology = JSON.parse(etymologyText.replace(/```json\n?|\n?```/g, ''));
-    } catch {
-      etymology = { description: etymologyText };
-    }
-
-    const responseData = {
+    // Use the etymology library which handles caching, Wiktionary, and CF AI fallback
+    const etymologyData = await getFullEtymology(
       word,
       language,
-      ...etymology,
-      cached: false,
-    };
+      c.env.CACHE_KV,
+      c.env.AI
+    );
 
-    await c.env.CACHE_KV.put(cacheKey, JSON.stringify(responseData), {
-      expirationTtl: 604800, // 1 week cache for etymology
-    });
-
-    return c.json(responseData);
+    return c.json(etymologyData);
   } catch (err: any) {
     console.error('[ETYMOLOGY] Error:', err);
     return c.json({ error: 'Etymology lookup failed', message: err.message }, 500);
@@ -442,29 +1294,8 @@ app.post('/conjugate', async (c) => {
       return c.json({ ...JSON.parse(cached), cached: true });
     }
 
-    const openaiKey = c.env.OPENAI_API_KEY;
-    if (!openaiKey) {
-      return c.json({
-        verb,
-        language,
-        conjugations: {},
-        note: 'Configure OpenAI for full conjugation data',
-        cached: false,
-      });
-    }
-
-    const response = await fetch('https://api.openai.com/v1/chat/completions', {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${openaiKey}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        model: c.env.OPENAI_MODEL || 'gpt-4o-mini',
-        messages: [
-          {
-            role: 'system',
-            content: `You are a linguistics expert. Provide verb conjugations in JSON format:
+    // Use Cloudflare AI for conjugation
+    const systemPrompt = `You are a linguistics expert. Provide verb conjugations in JSON format:
 {
   "infinitive": "verb",
   "language": "language",
@@ -481,23 +1312,21 @@ app.post('/conjugate', async (c) => {
   "irregularities": ["note1", "note2"],
   "usage_examples": [{"tense": "tense", "example": "sentence", "translation": "english"}]
 }
-Adapt subject pronouns to the target language conventions.`,
-          },
-          { role: 'user', content: `Conjugate the ${language} verb "${verb}" in these tenses: ${tenses.join(', ')}` },
-        ],
-        temperature: 0.2,
-        max_tokens: 2000,
-      }),
-    });
+Adapt subject pronouns to the target language conventions.`;
 
-    const result = await response.json() as any;
-    const conjugationText = result.choices[0]?.message?.content?.trim() || '{}';
+    const conjugationData = await callCFAIForJSON(
+      c,
+      systemPrompt,
+      `Conjugate the ${language} verb "${verb}" in these tenses: ${tenses.join(', ')}`
+    );
 
-    let conjugationData;
-    try {
-      conjugationData = JSON.parse(conjugationText.replace(/```json\n?|\n?```/g, ''));
-    } catch {
-      conjugationData = { raw: conjugationText };
+    if (!conjugationData) {
+      return c.json({
+        verb,
+        language,
+        error: 'Failed to generate conjugation data',
+        cached: false,
+      }, 500);
     }
 
     const responseData = {
@@ -531,28 +1360,8 @@ app.post('/analyze', async (c) => {
       return c.json({ error: 'text required' }, 400);
     }
 
-    const openaiKey = c.env.OPENAI_API_KEY;
-    if (!openaiKey) {
-      return c.json({
-        text,
-        language,
-        analysis: { note: 'Configure OpenAI for linguistic analysis' },
-        cached: false,
-      });
-    }
-
-    const response = await fetch('https://api.openai.com/v1/chat/completions', {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${openaiKey}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        model: c.env.OPENAI_MODEL || 'gpt-4o-mini',
-        messages: [
-          {
-            role: 'system',
-            content: `You are a linguistics expert. Analyze the text and provide:
+    // Use Cloudflare AI for analysis
+    const systemPrompt = `You are a linguistics expert. Analyze the text and provide:
 {
   "detectedLanguage": "language code",
   "words": [
@@ -572,23 +1381,21 @@ app.post('/analyze', async (c) => {
   ],
   "sentence_structure": "brief grammatical analysis",
   "difficulty_level": "beginner/intermediate/advanced"
-}`,
-          },
-          { role: 'user', content: `Analyze this ${language !== 'auto' ? language : ''} text: "${text}"` },
-        ],
-        temperature: 0.2,
-        max_tokens: 2000,
-      }),
-    });
+}`;
 
-    const result = await response.json() as any;
-    const analysisText = result.choices[0]?.message?.content?.trim() || '{}';
+    const analysis = await callCFAIForJSON(
+      c,
+      systemPrompt,
+      `Analyze this ${language !== 'auto' ? language : ''} text: "${text}"`
+    );
 
-    let analysis;
-    try {
-      analysis = JSON.parse(analysisText.replace(/```json\n?|\n?```/g, ''));
-    } catch {
-      analysis = { raw: analysisText };
+    if (!analysis) {
+      return c.json({
+        text,
+        language,
+        error: 'Failed to analyze text',
+        cached: false,
+      }, 500);
     }
 
     return c.json({
@@ -617,29 +1424,8 @@ app.post('/translate/educational', async (c) => {
       return c.json({ error: 'text and to language required' }, 400);
     }
 
-    const openaiKey = c.env.OPENAI_API_KEY;
-    if (!openaiKey) {
-      return c.json({
-        original: text,
-        translated: `[${to.toUpperCase()}] ${text}`,
-        learningNotes: [],
-        vocabulary: [],
-        cached: false,
-      });
-    }
-
-    const response = await fetch('https://api.openai.com/v1/chat/completions', {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${openaiKey}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        model: c.env.OPENAI_MODEL || 'gpt-4o-mini',
-        messages: [
-          {
-            role: 'system',
-            content: `You are an educational translator. Provide translation with learning aids:
+    // Use Cloudflare AI for educational translation
+    const systemPrompt = `You are an educational translator. Provide translation with learning aids:
 {
   "translation": "translated text",
   "literal": "word-for-word translation if helpful",
@@ -652,23 +1438,25 @@ app.post('/translate/educational', async (c) => {
   "cultural_notes": ["relevant cultural context"],
   "difficulty": "${level}"
 }
-Adapt explanations to ${level} level learners.`,
-          },
-          { role: 'user', content: `Translate from ${from === 'auto' ? 'detected language' : from} to ${to}: "${text}"` },
-        ],
-        temperature: 0.3,
-        max_tokens: 2000,
-      }),
-    });
+Adapt explanations to ${level} level learners.`;
 
-    const result = await response.json() as any;
-    const eduText = result.choices[0]?.message?.content?.trim() || '{}';
+    const eduTranslation = await callCFAIForJSON(
+      c,
+      systemPrompt,
+      `Translate from ${from === 'auto' ? 'detected language' : from} to ${to}: "${text}"`
+    );
 
-    let eduTranslation;
-    try {
-      eduTranslation = JSON.parse(eduText.replace(/```json\n?|\n?```/g, ''));
-    } catch {
-      eduTranslation = { translation: eduText };
+    if (!eduTranslation) {
+      // Fallback to basic translation
+      const basicTranslation = await translateWithCF(c, text, from, to);
+      return c.json({
+        original: text,
+        from_language: from,
+        to_language: to,
+        level,
+        translation: basicTranslation,
+        cached: false,
+      });
     }
 
     return c.json({

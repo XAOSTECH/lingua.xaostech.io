@@ -3,14 +3,19 @@ compatibility_date = "2025-12-31"
 main = "src/index.ts"
 send_metrics = false
 
+[ai]
+binding = "AI"
+
 [env.production]
 name = "xaostech-lingua"
 main = "src/index.ts"
 routes = [{ pattern = "lingua.xaostech.io/*", zone_name = "xaostech.io" }]
 
+[env.production.ai]
+binding = "AI"
+
 [env.production.vars]
 CACHE_TTL_SECONDS = "86400"
-OPENAI_MODEL = "gpt-4o-mini"
 
 [[env.production.kv_namespaces]]
 binding = "TRANSLATIONS_KV"
@@ -23,6 +28,8 @@ id = "${KV_CACHE_ID}"
 [env.testing]
 routes = [{ pattern = "lingua.testing.local/*", zone_name = "localhost" }]
 
+[env.testing.ai]
+binding = "AI"
+
 [env.testing.vars]
 CACHE_TTL_SECONDS = "86400"
-OPENAI_MODEL = "gpt-4o-mini"

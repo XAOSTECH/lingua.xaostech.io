@@ -772,6 +772,9 @@ app.all('/api/*', createApiProxyRoute());
 // ============ FAVICON ============
 app.get('/favicon.ico', serveFaviconHono);
 
+// Cache version - increment to invalidate old cached translations
+const CACHE_VERSION = 'v2';
+
 // ============ TRANSLATION ENDPOINTS ============
 
 // Translate text - Now with dictionary fallback
@@ -784,17 +787,22 @@ app.post('/translate', async (c) => {
       return c.json({ error: 'text and to language required' }, 400);
     }
 
+    // Check for cache bypass header
+    const bypassCache = c.req.header('X-Bypass-Cache') === 'true';
+
     // Normalize inputs
     const normalizedText = text.trim().substring(0, 5000);
-    const cacheKey = `trans:${from}:${to}:${hashString(normalizedText)}`;
+    const cacheKey = `${CACHE_VERSION}:trans:${from}:${to}:${hashString(normalizedText)}`;
 
-    // 1. Check KV cache first
-    const cached = await c.env.CACHE_KV.get(cacheKey);
-    if (cached) {
-      const result = JSON.parse(cached);
-      return c.json({ ...result, cached: true }, 200, {
-        'X-Cache': 'HIT',
-      });
+    // 1. Check KV cache first (unless bypassed)
+    if (!bypassCache) {
+      const cached = await c.env.CACHE_KV.get(cacheKey);
+      if (cached) {
+        const result = JSON.parse(cached);
+        return c.json({ ...result, cached: true }, 200, {
+          'X-Cache': 'HIT',
+        });
+      }
     }
 
     // 2. Try dictionary-based translation for simple words/phrases
@@ -934,7 +942,7 @@ app.post('/translate/batch', async (c) => {
     const results = await Promise.all(
       texts.map(async (text) => {
         const trimmedText = text.trim().toLowerCase();
-        const cacheKey = `trans:${sourceLanguage}:${to}:${hashString(trimmedText)}`;
+        const cacheKey = `${CACHE_VERSION}:trans:${sourceLanguage}:${to}:${hashString(trimmedText)}`;
         const cached = await c.env.CACHE_KV.get(cacheKey);
 
         if (cached) {

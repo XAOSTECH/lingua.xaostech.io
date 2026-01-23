@@ -87,7 +87,7 @@ app.post('/translate', async (c) => {
         to_language: to,
         cached: false,
       };
-      
+
       // Cache the stub
       await c.env.CACHE_KV.put(cacheKey, JSON.stringify(stubResult), {
         expirationTtl: parseInt(c.env.CACHE_TTL_SECONDS) || 86400,
@@ -145,7 +145,7 @@ app.post('/translate/batch', async (c) => {
       texts.map(async (text) => {
         const cacheKey = `trans:${from}:${to}:${hashString(text.trim())}`;
         const cached = await c.env.CACHE_KV.get(cacheKey);
-        
+
         if (cached) {
           return { ...JSON.parse(cached), cached: true };
         }
@@ -208,14 +208,14 @@ app.get('/languages', (c) => {
 // Clear translation cache (admin only)
 app.delete('/cache', async (c) => {
   const adminKey = c.req.header('X-Admin-Key');
-  
+
   // Simple admin check - in production, use proper auth
   if (!adminKey) {
     return c.json({ error: 'Admin key required' }, 401);
   }
 
   // Note: KV doesn't support bulk delete, would need to track keys
-  return c.json({ 
+  return c.json({
     message: 'Cache clearing not implemented - KV requires individual key deletion',
     suggestion: 'Set shorter TTL or use Cloudflare Dashboard',
   });
@@ -327,10 +327,380 @@ const SUPPORTED_LANGUAGES = [
   { code: 'el', name: 'Greek' },
   { code: 'ro', name: 'Romanian' },
   { code: 'hu', name: 'Hungarian' },
+  { code: 'la', name: 'Latin' },
+  { code: 'grc', name: 'Ancient Greek' },
+  { code: 'sa', name: 'Sanskrit' },
 ];
 
+// ============ EDUCATIONAL ENDPOINTS ============
+
+// Etymology lookup - traces word origins
+app.post('/etymology', async (c) => {
+  try {
+    const { word, language = 'en' } = await c.req.json<{ word: string; language?: string }>();
+
+    if (!word) {
+      return c.json({ error: 'word required' }, 400);
+    }
+
+    const cacheKey = `etym:${language}:${hashString(word)}`;
+    const cached = await c.env.CACHE_KV.get(cacheKey);
+
+    if (cached) {
+      return c.json({ ...JSON.parse(cached), cached: true });
+    }
+
+    const openaiKey = c.env.OPENAI_API_KEY;
+    if (!openaiKey) {
+      // Stub response for development
+      return c.json({
+        word,
+        language,
+        etymology: `[Etymology for "${word}" - configure OpenAI for real data]`,
+        roots: [],
+        cognates: [],
+        cached: false,
+      });
+    }
+
+    const response = await fetch('https://api.openai.com/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${openaiKey}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        model: c.env.OPENAI_MODEL || 'gpt-4o-mini',
+        messages: [
+          {
+            role: 'system',
+            content: `You are an expert etymologist. Provide detailed word etymology in JSON format:
+{
+  "origin": "language of origin",
+  "originalForm": "word in original language",
+  "meaning": "original meaning",
+  "evolution": ["stage1", "stage2", "..."],
+  "roots": [{"root": "root word", "meaning": "meaning", "language": "lang"}],
+  "cognates": [{"word": "word", "language": "lang", "meaning": "meaning"}],
+  "firstRecorded": "approximate date/period",
+  "relatedWords": ["word1", "word2"]
+}
+Return only valid JSON.`,
+          },
+          { role: 'user', content: `Provide etymology for the ${language} word: "${word}"` },
+        ],
+        temperature: 0.3,
+        max_tokens: 1500,
+      }),
+    });
+
+    const result = await response.json() as any;
+    const etymologyText = result.choices[0]?.message?.content?.trim() || '{}';
+
+    let etymology;
+    try {
+      etymology = JSON.parse(etymologyText.replace(/```json\n?|\n?```/g, ''));
+    } catch {
+      etymology = { description: etymologyText };
+    }
+
+    const responseData = {
+      word,
+      language,
+      ...etymology,
+      cached: false,
+    };
+
+    await c.env.CACHE_KV.put(cacheKey, JSON.stringify(responseData), {
+      expirationTtl: 604800, // 1 week cache for etymology
+    });
+
+    return c.json(responseData);
+  } catch (err: any) {
+    console.error('[ETYMOLOGY] Error:', err);
+    return c.json({ error: 'Etymology lookup failed', message: err.message }, 500);
+  }
+});
+
+// Conjugation tables for verbs
+app.post('/conjugate', async (c) => {
+  try {
+    const { verb, language, tenses = ['present', 'past', 'future'] } = await c.req.json<{
+      verb: string;
+      language: string;
+      tenses?: string[];
+    }>();
+
+    if (!verb || !language) {
+      return c.json({ error: 'verb and language required' }, 400);
+    }
+
+    const cacheKey = `conj:${language}:${hashString(verb)}:${tenses.join('-')}`;
+    const cached = await c.env.CACHE_KV.get(cacheKey);
+
+    if (cached) {
+      return c.json({ ...JSON.parse(cached), cached: true });
+    }
+
+    const openaiKey = c.env.OPENAI_API_KEY;
+    if (!openaiKey) {
+      return c.json({
+        verb,
+        language,
+        conjugations: {},
+        note: 'Configure OpenAI for full conjugation data',
+        cached: false,
+      });
+    }
+
+    const response = await fetch('https://api.openai.com/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${openaiKey}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        model: c.env.OPENAI_MODEL || 'gpt-4o-mini',
+        messages: [
+          {
+            role: 'system',
+            content: `You are a linguistics expert. Provide verb conjugations in JSON format:
+{
+  "infinitive": "verb",
+  "language": "language",
+  "conjugations": {
+    "tense_name": {
+      "I/1sg": "form",
+      "you/2sg": "form",
+      "he-she-it/3sg": "form",
+      "we/1pl": "form",
+      "you-all/2pl": "form",
+      "they/3pl": "form"
+    }
+  },
+  "irregularities": ["note1", "note2"],
+  "usage_examples": [{"tense": "tense", "example": "sentence", "translation": "english"}]
+}
+Adapt subject pronouns to the target language conventions.`,
+          },
+          { role: 'user', content: `Conjugate the ${language} verb "${verb}" in these tenses: ${tenses.join(', ')}` },
+        ],
+        temperature: 0.2,
+        max_tokens: 2000,
+      }),
+    });
+
+    const result = await response.json() as any;
+    const conjugationText = result.choices[0]?.message?.content?.trim() || '{}';
+
+    let conjugationData;
+    try {
+      conjugationData = JSON.parse(conjugationText.replace(/```json\n?|\n?```/g, ''));
+    } catch {
+      conjugationData = { raw: conjugationText };
+    }
+
+    const responseData = {
+      verb,
+      language,
+      ...conjugationData,
+      cached: false,
+    };
+
+    await c.env.CACHE_KV.put(cacheKey, JSON.stringify(responseData), {
+      expirationTtl: 604800,
+    });
+
+    return c.json(responseData);
+  } catch (err: any) {
+    console.error('[CONJUGATE] Error:', err);
+    return c.json({ error: 'Conjugation failed', message: err.message }, 500);
+  }
+});
+
+// Word analysis for educational content
+app.post('/analyze', async (c) => {
+  try {
+    const { text, language = 'auto', features = ['pos', 'morphology'] } = await c.req.json<{
+      text: string;
+      language?: string;
+      features?: string[];
+    }>();
+
+    if (!text) {
+      return c.json({ error: 'text required' }, 400);
+    }
+
+    const openaiKey = c.env.OPENAI_API_KEY;
+    if (!openaiKey) {
+      return c.json({
+        text,
+        language,
+        analysis: { note: 'Configure OpenAI for linguistic analysis' },
+        cached: false,
+      });
+    }
+
+    const response = await fetch('https://api.openai.com/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${openaiKey}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        model: c.env.OPENAI_MODEL || 'gpt-4o-mini',
+        messages: [
+          {
+            role: 'system',
+            content: `You are a linguistics expert. Analyze the text and provide:
+{
+  "detectedLanguage": "language code",
+  "words": [
+    {
+      "word": "word",
+      "lemma": "dictionary form",
+      "pos": "part of speech",
+      "morphology": {
+        "gender": "if applicable",
+        "number": "singular/plural",
+        "case": "if applicable",
+        "tense": "if verb",
+        "mood": "if verb"
+      },
+      "translation": "English translation"
+    }
+  ],
+  "sentence_structure": "brief grammatical analysis",
+  "difficulty_level": "beginner/intermediate/advanced"
+}`,
+          },
+          { role: 'user', content: `Analyze this ${language !== 'auto' ? language : ''} text: "${text}"` },
+        ],
+        temperature: 0.2,
+        max_tokens: 2000,
+      }),
+    });
+
+    const result = await response.json() as any;
+    const analysisText = result.choices[0]?.message?.content?.trim() || '{}';
+
+    let analysis;
+    try {
+      analysis = JSON.parse(analysisText.replace(/```json\n?|\n?```/g, ''));
+    } catch {
+      analysis = { raw: analysisText };
+    }
+
+    return c.json({
+      text,
+      language,
+      ...analysis,
+      cached: false,
+    });
+  } catch (err: any) {
+    console.error('[ANALYZE] Error:', err);
+    return c.json({ error: 'Analysis failed', message: err.message }, 500);
+  }
+});
+
+// Educational translation - includes learning context
+app.post('/translate/educational', async (c) => {
+  try {
+    const { text, from = 'auto', to, level = 'intermediate' } = await c.req.json<{
+      text: string;
+      from?: string;
+      to: string;
+      level?: 'beginner' | 'intermediate' | 'advanced';
+    }>();
+
+    if (!text || !to) {
+      return c.json({ error: 'text and to language required' }, 400);
+    }
+
+    const openaiKey = c.env.OPENAI_API_KEY;
+    if (!openaiKey) {
+      return c.json({
+        original: text,
+        translated: `[${to.toUpperCase()}] ${text}`,
+        learningNotes: [],
+        vocabulary: [],
+        cached: false,
+      });
+    }
+
+    const response = await fetch('https://api.openai.com/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${openaiKey}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        model: c.env.OPENAI_MODEL || 'gpt-4o-mini',
+        messages: [
+          {
+            role: 'system',
+            content: `You are an educational translator. Provide translation with learning aids:
+{
+  "translation": "translated text",
+  "literal": "word-for-word translation if helpful",
+  "vocabulary": [
+    {"source": "word", "target": "translation", "pos": "part of speech", "note": "usage note"}
+  ],
+  "grammar_points": [
+    {"point": "grammar concept", "explanation": "brief explanation", "example": "example"}
+  ],
+  "cultural_notes": ["relevant cultural context"],
+  "difficulty": "${level}"
+}
+Adapt explanations to ${level} level learners.`,
+          },
+          { role: 'user', content: `Translate from ${from === 'auto' ? 'detected language' : from} to ${to}: "${text}"` },
+        ],
+        temperature: 0.3,
+        max_tokens: 2000,
+      }),
+    });
+
+    const result = await response.json() as any;
+    const eduText = result.choices[0]?.message?.content?.trim() || '{}';
+
+    let eduTranslation;
+    try {
+      eduTranslation = JSON.parse(eduText.replace(/```json\n?|\n?```/g, ''));
+    } catch {
+      eduTranslation = { translation: eduText };
+    }
+
+    return c.json({
+      original: text,
+      from_language: from,
+      to_language: to,
+      level,
+      ...eduTranslation,
+      cached: false,
+    });
+  } catch (err: any) {
+    console.error('[TRANSLATE/EDUCATIONAL] Error:', err);
+    return c.json({ error: 'Educational translation failed', message: err.message }, 500);
+  }
+});
+
 // ============ ERROR HANDLING ============
-app.notFound((c) => c.json({ error: 'Not found', path: c.req.path }, 404));
+app.notFound((c) => c.json({
+  error: 'Not found',
+  path: c.req.path,
+  availableEndpoints: [
+    'POST /translate',
+    'POST /translate/batch',
+    'POST /translate/educational',
+    'POST /detect',
+    'POST /etymology',
+    'POST /conjugate',
+    'POST /analyze',
+    'GET /languages',
+    'GET /health',
+  ],
+}, 404));
 
 app.onError((err, c) => {
   console.error('[LINGUA] Error:', err);

@@ -427,6 +427,18 @@ export async function exportAsDict(kv: KVNamespace): Promise<Record<string, any>
 }
 
 /**
+ * Escape a string so it can be safely embedded in a double-quoted TS string literal.
+ */
+function escapeForDoubleQuotedString(value: string): string {
+    return value
+        .replace(/\\/g, '\\\\')  // escape backslashes
+        .replace(/"/g, '\\"')    // escape double quotes
+        .replace(/\r/g, '\\r')   // normalize control characters
+        .replace(/\n/g, '\\n')
+        .replace(/\t/g, '\\t');
+}
+
+/**
  * Generate dictionary entries TypeScript code for PR
  */
 export function generateDictEntries(words: LearnedWord[]): string {
@@ -434,7 +446,7 @@ export function generateDictEntries(words: LearnedWord[]): string {
 
     for (const word of words) {
         const translationsStr = Object.entries(word.translations)
-            .map(([lang, trans]) => `${lang}: "${trans.replace(/"/g, '\\"')}"`)
+            .map(([lang, trans]) => `${lang}: "${escapeForDoubleQuotedString(trans)}"`)
             .join(', ');
 
         entries.push(`    "${word.word}": {

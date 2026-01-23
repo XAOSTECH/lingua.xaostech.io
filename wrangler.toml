@@ -16,23 +16,20 @@ binding = "AI"
 
 [env.production.vars]
 CACHE_TTL_SECONDS = "86400"
+GITHUB_OWNER = "xaostech"
+GITHUB_REPO = "XAOSTECH"
 
 [[env.production.kv_namespaces]]
 binding = "TRANSLATIONS_KV"
 id = "${KV_TRANSLATIONS_ID}"
 
 [[env.production.kv_namespaces]]
-binding = "CACHE_KV"
-id = "${KV_CACHE_ID}"
-
-[[env.production.kv_namespaces]]
 binding = "LEARNED_WORDS_KV"
 id = "${KV_LEARNED_WORDS_ID}"
 
-[env.production.vars]
-CACHE_TTL_SECONDS = "86400"
-GITHUB_OWNER = "xaostech"
-GITHUB_REPO = "XAOSTECH"
+[[env.production.kv_namespaces]]
+binding = "CACHE_KV"
+id = "${KV_CACHE_ID}"
 
 [env.testing]
 routes = [{ pattern = "lingua.testing.local/*", zone_name = "localhost" }]

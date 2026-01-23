@@ -133,24 +133,12 @@ export async function fetchFromWiktionary(word: string, language = 'en'): Promis
 }
 
 /**
- * Clean MediaWiki markup from text
+ * Clean MediaWiki markup from text using shared sanitisation library
  */
-function cleanWikiMarkup(text: string): string {
-    if (!text) return '';
+import { sanitiseMarkup } from '../../shared/types/sanitise';
 
-    return text
-        // Remove wiki links: [[link|display]] -> display, [[link]] -> link
-        .replace(/\[\[([^\]|]+)\|([^\]]+)\]\]/g, '$2')
-        .replace(/\[\[([^\]]+)\]\]/g, '$1')
-        // Remove templates: {{template}}
-        .replace(/\{\{[^}]+\}\}/g, '')
-        // Remove HTML tags
-        .replace(/<[^>]+>/g, '')
-        // Remove any remaining angle brackets to prevent tag/script injection
-        .replace(/[<>]/g, '')
-        // Clean up extra whitespace
-        .replace(/\s+/g, ' ')
-        .trim();
+function cleanWikiMarkup(text: string): string {
+    return sanitiseMarkup(text);
 }
 
 /**

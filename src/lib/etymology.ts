@@ -135,17 +135,37 @@ export async function fetchFromWiktionary(word: string, language = 'en'): Promis
 /**
  * Clean MediaWiki markup from text
  */
+function removeHtmlTags(text: string): string {
+    if (!text) return '';
+
+    let previous: string;
+    let current = text;
+
+    // Repeatedly remove HTML-like tags until no more matches are found.
+    // This avoids incomplete multi-character sanitization where removing one
+    // tag instance could reveal another.
+    do {
+        previous = current;
+        current = current.replace(/<[^>]+>/g, '');
+    } while (current !== previous);
+
+    return current;
+}
+
 function cleanWikiMarkup(text: string): string {
     if (!text) return '';
 
-    return text
+    let cleaned = text
         // Remove wiki links: [[link|display]] -> display, [[link]] -> link
         .replace(/\[\[([^\]|]+)\|([^\]]+)\]\]/g, '$2')
         .replace(/\[\[([^\]]+)\]\]/g, '$1')
         // Remove templates: {{template}}
-        .replace(/\{\{[^}]+\}\}/g, '')
-        // Remove HTML tags
-        .replace(/<[^>]+>/g, '')
+        .replace(/\{\{[^}]+\}\}/g, '');
+
+    // Remove HTML tags (including nested/overlapping patterns)
+    cleaned = removeHtmlTags(cleaned);
+
+    return cleaned
         // Remove any remaining angle brackets to prevent tag/script injection
         .replace(/[<>]/g, '')
         // Clean up extra whitespace

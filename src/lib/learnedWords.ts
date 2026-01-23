@@ -3,12 +3,12 @@
  * lingua.xaostech.io - Learned Words Storage System
  * =============================================================================
  * Stores unknown words that required AI translation for future dictionary 
- * integration. When 10+ new words accumulate, triggers a GitHub action to 
- * create a PR adding them to the embedded dictionary.
+ * integration. Supports configurable PR thresholds and bulk uploads.
  * 
  * Storage Structure (KV: LEARNED_WORDS_KV):
  * - `word:{word}` -> LearnedWord JSON
- * - `meta:stats` -> { count, lastSync, pendingPR }
+ * - `meta:stats` -> { count, lastSync, pendingPR, config }
+ * - `meta:config` -> { prThreshold, maxBulkSize, autoTrigger }
  * - `queue:pending` -> Array of pending word keys
  * =============================================================================
  */
@@ -23,6 +23,7 @@ export interface LearnedWord {
     lastSeen: string;
     confidence: number;
     contexts?: string[];
+    source?: 'ai' | 'bulk' | 'user'; // How the word was added
 }
 
 export interface LearningStats {
@@ -33,14 +34,61 @@ export interface LearningStats {
     isProcessing: boolean;
 }
 
+export interface LearningConfig {
+    prThreshold: number;      // Words needed to trigger PR (default: 10)
+    maxBulkSize: number;      // Max words per bulk upload (default: 1000)
+    maxWordsPerPR: number;    // Max words to include in single PR (default: 500)
+    autoTrigger: boolean;     // Auto-trigger PR when threshold reached
+    minConfidence: number;    // Min confidence for PR inclusion (default: 0.7)
+}
+
 export interface LearnedWordsEnv {
     LEARNED_WORDS_KV: KVNamespace;
     GITHUB_TOKEN?: string;
     GITHUB_REPO?: string;
 }
 
-// Threshold for triggering GitHub PR
-const PR_TRIGGER_THRESHOLD = 10;
+// Default configuration
+const DEFAULT_CONFIG: LearningConfig = {
+    prThreshold: 10,
+    maxBulkSize: 1000,
+    maxWordsPerPR: 500,
+    autoTrigger: true,
+    minConfidence: 0.7,
+};
+
+// Bulk upload size tiers
+export const BULK_TIERS = {
+    small: { max: 100, label: 'Small (up to 100 words)' },
+    medium: { max: 500, label: 'Medium (up to 500 words)' },
+    large: { max: 1000, label: 'Large (up to 1,000 words)' },
+    xlarge: { max: 5000, label: 'Extra Large (up to 5,000 words)' },
+    unlimited: { max: Infinity, label: 'Unlimited (admin only)' },
+} as const;
+
+export type BulkTier = keyof typeof BULK_TIERS;
+
+/**
+ * Get current learning configuration
+ */
+export async function getConfig(kv: KVNamespace): Promise<LearningConfig> {
+    const configKey = 'meta:config';
+    const data = await kv.get(configKey);
+    return data ? { ...DEFAULT_CONFIG, ...JSON.parse(data) } : DEFAULT_CONFIG;
+}
+
+/**
+ * Update learning configuration
+ */
+export async function setConfig(
+    kv: KVNamespace,
+    updates: Partial<LearningConfig>
+): Promise<LearningConfig> {
+    const current = await getConfig(kv);
+    const updated = { ...current, ...updates };
+    await kv.put('meta:config', JSON.stringify(updated));
+    return updated;
+}
 
 /**
  * Check if a word has been learned previously
@@ -66,6 +114,7 @@ export async function storeLearnedWord(
         detectedPos?: string;
         confidence?: number;
         context?: string;
+        source?: 'ai' | 'bulk' | 'user';
     } = {}
 ): Promise<{ stored: boolean; shouldTriggerPR: boolean; pendingCount: number }> {
     const normalizedWord = word.toLowerCase().trim();
@@ -106,6 +155,7 @@ export async function storeLearnedWord(
         lastSeen: now,
         confidence: options.confidence || 0.7,
         contexts: options.context ? [options.context] : undefined,
+        source: options.source || 'ai',
     };
 
     await kv.put(key, JSON.stringify(newWord));
@@ -113,11 +163,137 @@ export async function storeLearnedWord(
     // Add to pending queue
     await addToPendingQueue(kv, normalizedWord);
 
-    // Check if we should trigger PR
-    const stats = await getStats(kv);
-    const shouldTriggerPR = stats.pendingCount >= PR_TRIGGER_THRESHOLD && !stats.isProcessing;
+    // Check if we should trigger PR based on config
+    const [stats, config] = await Promise.all([getStats(kv), getConfig(kv)]);
+    const shouldTriggerPR = config.autoTrigger && 
+                            stats.pendingCount >= config.prThreshold && 
+                            !stats.isProcessing;
 
     return { stored: true, shouldTriggerPR, pendingCount: stats.pendingCount };
+}
+
+/**
+ * Bulk upload words - supports large batches with tier-based limits
+ */
+export interface BulkUploadOptions {
+    tier?: BulkTier;
+    source?: 'bulk' | 'user';
+    sourceLanguage?: string;
+    triggerPRThreshold?: number;  // Override default PR threshold for this upload
+    skipDuplicates?: boolean;      // Skip words already in queue
+}
+
+export interface BulkUploadResult {
+    success: boolean;
+    added: number;
+    updated: number;
+    skipped: number;
+    errors: Array<{ word: string; error: string }>;
+    pendingCount: number;
+    shouldTriggerPR: boolean;
+    prThreshold: number;
+}
+
+export async function bulkUploadWords(
+    kv: KVNamespace,
+    words: Array<{ word: string; translations: Record<string, string>; pos?: string; confidence?: number }>,
+    options: BulkUploadOptions = {}
+): Promise<BulkUploadResult> {
+    const tier = options.tier || 'medium';
+    const maxAllowed = BULK_TIERS[tier].max;
+    const config = await getConfig(kv);
+    
+    // Validate batch size
+    if (words.length > maxAllowed && tier !== 'unlimited') {
+        return {
+            success: false,
+            added: 0,
+            updated: 0,
+            skipped: 0,
+            errors: [{ word: '', error: `Batch size ${words.length} exceeds tier limit of ${maxAllowed}` }],
+            pendingCount: 0,
+            shouldTriggerPR: false,
+            prThreshold: config.prThreshold,
+        };
+    }
+
+    let added = 0;
+    let updated = 0;
+    let skipped = 0;
+    const errors: Array<{ word: string; error: string }> = [];
+    const now = new Date().toISOString();
+
+    // Process in batches for efficiency
+    const batchSize = 50;
+    for (let i = 0; i < words.length; i += batchSize) {
+        const batch = words.slice(i, i + batchSize);
+        
+        await Promise.all(batch.map(async (item) => {
+            try {
+                const normalizedWord = item.word.toLowerCase().trim();
+                
+                // Validate word
+                if (!normalizedWord || normalizedWord.length < 2 || normalizedWord.length > 50) {
+                    skipped++;
+                    return;
+                }
+                
+                const existing = await getLearnedWord(kv, normalizedWord);
+                
+                if (existing) {
+                    if (options.skipDuplicates) {
+                        skipped++;
+                        return;
+                    }
+                    // Update existing
+                    const updatedWord: LearnedWord = {
+                        ...existing,
+                        translations: { ...existing.translations, ...item.translations },
+                        seenCount: existing.seenCount + 1,
+                        lastSeen: now,
+                        confidence: item.confidence || existing.confidence,
+                    };
+                    await kv.put(`word:${normalizedWord}`, JSON.stringify(updatedWord));
+                    updated++;
+                } else {
+                    // Create new
+                    const newWord: LearnedWord = {
+                        word: normalizedWord,
+                        sourceLanguage: options.sourceLanguage || 'en',
+                        translations: item.translations,
+                        detectedPos: item.pos,
+                        firstSeen: now,
+                        seenCount: 1,
+                        lastSeen: now,
+                        confidence: item.confidence || 0.9, // Higher confidence for bulk uploads
+                        source: options.source || 'bulk',
+                    };
+                    await kv.put(`word:${normalizedWord}`, JSON.stringify(newWord));
+                    await addToPendingQueue(kv, normalizedWord);
+                    added++;
+                }
+            } catch (err: any) {
+                errors.push({ word: item.word, error: err.message });
+            }
+        }));
+    }
+
+    const stats = await getStats(kv);
+    const prThreshold = options.triggerPRThreshold || config.prThreshold;
+    const shouldTriggerPR = config.autoTrigger && 
+                            stats.pendingCount >= prThreshold && 
+                            !stats.isProcessing;
+
+    return {
+        success: errors.length === 0,
+        added,
+        updated,
+        skipped,
+        errors,
+        pendingCount: stats.pendingCount,
+        shouldTriggerPR,
+        prThreshold,
+    };
 }
 
 /**

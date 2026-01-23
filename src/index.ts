@@ -13,6 +13,15 @@ import {
   type TranslationResult,
 } from './lib/dictionary';
 import { getFullEtymology, getDefinitions } from './lib/etymology';
+import {
+  storeLearnedWord,
+  getLearnedTranslation,
+  getPendingWords,
+  clearPendingQueue,
+  getStats as getLearnedStats,
+  markProcessing,
+} from './lib/learnedWords';
+import { createDictionaryPR } from './lib/githubPR';
 
 // Cloudflare AI model IDs
 const CF_TRANSLATION_MODEL = '@cf/meta/m2m100-1.2b';
@@ -22,8 +31,12 @@ const CF_TEXT_MODEL_FAST = '@cf/meta/llama-3.1-8b-instruct-fast';
 interface Env {
   TRANSLATIONS_KV: KVNamespace;
   CACHE_KV: KVNamespace;
+  LEARNED_WORDS_KV: KVNamespace;
   CACHE_TTL_SECONDS: string;
   AI: Ai; // Cloudflare Workers AI binding
+  GITHUB_TOKEN?: string;
+  GITHUB_OWNER?: string;
+  GITHUB_REPO?: string;
   API_ACCESS_CLIENT_ID?: string;
   API_ACCESS_CLIENT_SECRET?: string;
 }
@@ -858,6 +871,35 @@ app.post('/translate', async (c) => {
       // Use CF AI for full translation
       translatedText = await translateWithCF(c, normalizedText, from, to, context);
 
+      // Store unknown words for learning (single words only)
+      const unknownWords = partialResult.filter(r => r.source === 'unknown');
+      if (c.env.LEARNED_WORDS_KV && unknownWords.length > 0) {
+        // For each unknown single word, learn its translation
+        const translatedParts = translatedText.split(/\s+/);
+        for (let i = 0; i < unknownWords.length && i < translatedParts.length; i++) {
+          const unknownWord = unknownWords[i].word;
+          // Only store single words (not phrases)
+          if (unknownWord.length >= 2 && unknownWord.length <= 30 && /^[a-z]+$/i.test(unknownWord)) {
+            // Try to get full translations for all languages
+            const allTranslations: Record<string, string> = { [to]: translatedParts[i] };
+
+            // Store the learned word
+            const { shouldTriggerPR, pendingCount } = await storeLearnedWord(
+              c.env.LEARNED_WORDS_KV,
+              unknownWord,
+              allTranslations,
+              { sourceLanguage: from, context: normalizedText.substring(0, 100) }
+            );
+
+            // Check if we should trigger GitHub PR
+            if (shouldTriggerPR && c.env.GITHUB_TOKEN && c.env.GITHUB_OWNER && c.env.GITHUB_REPO) {
+              // Fire and forget - don't block the response
+              triggerDictionaryPR(c.env).catch(err => console.error('[LEARN] PR trigger failed:', err));
+            }
+          }
+        }
+      }
+
       const result: TranslationResponse = {
         original: normalizedText,
         translated: translatedText,
@@ -1050,6 +1092,86 @@ app.delete('/cache', async (c) => {
     suggestion: 'Set shorter TTL or use Cloudflare Dashboard',
   });
 });
+
+// ============ LEARNED WORDS ENDPOINTS ============
+
+// Get learning statistics
+app.get('/learned/stats', async (c) => {
+  if (!c.env.LEARNED_WORDS_KV) {
+    return c.json({ error: 'Learning system not configured' }, 503);
+  }
+
+  const stats = await getLearnedStats(c.env.LEARNED_WORDS_KV);
+  const dictStats = getDictionaryStats();
+
+  return c.json({
+    learning: stats,
+    dictionary: dictStats,
+    prThreshold: 10,
+  });
+});
+
+// Get pending learned words
+app.get('/learned/pending', async (c) => {
+  if (!c.env.LEARNED_WORDS_KV) {
+    return c.json({ error: 'Learning system not configured' }, 503);
+  }
+
+  const pending = await getPendingWords(c.env.LEARNED_WORDS_KV);
+  return c.json({ pending, count: pending.length });
+});
+
+// Manually trigger dictionary PR (admin only)
+app.post('/learned/trigger-pr', async (c) => {
+  const adminKey = c.req.header('X-Admin-Key');
+  if (!adminKey) {
+    return c.json({ error: 'Admin key required' }, 401);
+  }
+
+  if (!c.env.LEARNED_WORDS_KV || !c.env.GITHUB_TOKEN) {
+    return c.json({ error: 'Learning system or GitHub not configured' }, 503);
+  }
+
+  const result = await triggerDictionaryPR(c.env);
+  return c.json(result);
+});
+
+/**
+ * Trigger GitHub PR with pending learned words
+ */
+async function triggerDictionaryPR(env: Env): Promise<{ success: boolean; prUrl?: string; error?: string }> {
+  if (!env.LEARNED_WORDS_KV || !env.GITHUB_TOKEN || !env.GITHUB_OWNER || !env.GITHUB_REPO) {
+    return { success: false, error: 'Missing configuration' };
+  }
+
+  await markProcessing(env.LEARNED_WORDS_KV);
+
+  const pending = await getPendingWords(env.LEARNED_WORDS_KV);
+  if (pending.length === 0) {
+    return { success: false, error: 'No pending words' };
+  }
+
+  // Filter to only high-confidence words
+  const readyWords = pending.filter(w => w.confidence >= 0.7 || w.seenCount >= 3);
+  if (readyWords.length === 0) {
+    return { success: false, error: 'No words ready for PR (confidence too low)' };
+  }
+
+  const result = await createDictionaryPR(
+    {
+      token: env.GITHUB_TOKEN,
+      owner: env.GITHUB_OWNER,
+      repo: env.GITHUB_REPO,
+    },
+    readyWords
+  );
+
+  if (result.success && result.prNumber) {
+    await clearPendingQueue(env.LEARNED_WORDS_KV, result.prNumber);
+  }
+
+  return result;
+}
 
 // ============ HELPER FUNCTIONS ============
 

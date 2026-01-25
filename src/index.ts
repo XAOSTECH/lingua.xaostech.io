@@ -12,6 +12,13 @@ import {
   CORE_DICTIONARY,
   type TranslationResult,
 } from './lib/dictionary';
+import {
+  exportDictionaryToJSON,
+  exportLearnedWordsToJSON,
+  getDictionaryStatsFromD1,
+  lookupWordFromD1,
+  translateWordFromD1,
+} from './lib/d1-dictionary';
 import { getFullEtymology, getDefinitions } from './lib/etymology';
 import {
   storeLearnedWord,
@@ -38,6 +45,7 @@ interface Env {
   TRANSLATIONS_KV: KVNamespace;
   CACHE_KV: KVNamespace;
   LEARNED_WORDS_KV: KVNamespace;
+  LINGUA_DB: D1Database; // D1 database binding for dictionary
   CACHE_TTL_SECONDS: string;
   AI: Ai; // Cloudflare Workers AI binding
   GITHUB_TOKEN?: string;
@@ -783,7 +791,27 @@ app.get('/', (c) => {
 });
 
 // ============ HEALTH CHECK ============
-app.get('/health', (c) => c.json({ status: 'ok', service: 'lingua', dictionary_words: Object.keys(CORE_DICTIONARY).length }));
+app.get('/health', async (c) => {
+  const staticWords = Object.keys(CORE_DICTIONARY).length;
+  let d1Words = 0;
+
+  if (c.env.LINGUA_DB) {
+    try {
+      const result = await c.env.LINGUA_DB.prepare('SELECT COUNT(*) as count FROM dictionary_entries').first<{ count: number }>();
+      d1Words = result?.count || 0;
+    } catch {
+      // D1 not available or migration not run
+    }
+  }
+
+  return c.json({
+    status: 'ok',
+    service: 'lingua',
+    dictionary_words: staticWords,
+    d1_words: d1Words,
+    d1_enabled: !!c.env.LINGUA_DB,
+  });
+});
 
 // ============ API PROXY ============
 app.all('/api/*', createApiProxyRoute());
@@ -1099,6 +1127,63 @@ app.delete('/cache', async (c) => {
   });
 });
 
+// ============ D1 DICTIONARY EXPORT ENDPOINTS ============
+
+// Export dictionary to JSON (admin only)
+app.get('/api/dictionary/export', async (c) => {
+  const adminKey = c.req.header('X-Admin-Key');
+  if (!adminKey) {
+    return c.json({ error: 'Admin key required' }, 401);
+  }
+
+  if (!c.env.LINGUA_DB) {
+    return c.json({ error: 'D1 database not configured' }, 503);
+  }
+
+  const coreOnly = c.req.query('coreOnly') === 'true';
+
+  const exportData = await exportDictionaryToJSON(c.env.LINGUA_DB, { coreOnly });
+
+  return c.json(exportData, 200, {
+    'Content-Disposition': `attachment; filename="lingua-dictionary-${Date.now()}.json"`,
+  });
+});
+
+// Export learned words to JSON (admin only)
+app.get('/api/learned/export', async (c) => {
+  const adminKey = c.req.header('X-Admin-Key');
+  if (!adminKey) {
+    return c.json({ error: 'Admin key required' }, 401);
+  }
+
+  if (!c.env.LINGUA_DB) {
+    return c.json({ error: 'D1 database not configured' }, 503);
+  }
+
+  const exportData = await exportLearnedWordsToJSON(c.env.LINGUA_DB);
+
+  return c.json(exportData, 200, {
+    'Content-Disposition': `attachment; filename="lingua-learned-${Date.now()}.json"`,
+  });
+});
+
+// Get D1 dictionary stats
+app.get('/api/dictionary/stats', async (c) => {
+  if (!c.env.LINGUA_DB) {
+    // Fallback to static dictionary stats
+    return c.json(getDictionaryStats());
+  }
+
+  const d1Stats = await getDictionaryStatsFromD1(c.env.LINGUA_DB);
+  const staticStats = getDictionaryStats();
+
+  return c.json({
+    d1: d1Stats,
+    static: staticStats,
+    source: 'd1',
+  });
+});
+
 // ============ LEARNED WORDS ENDPOINTS ============
 
 // Get learning statistics and configuration
@@ -1126,7 +1211,7 @@ app.get('/learned/config', async (c) => {
   if (!c.env.LEARNED_WORDS_KV) {
     return c.json({ error: 'Learning system not configured' }, 503);
   }
-  
+
   const config = await getLearningConfig(c.env.LEARNED_WORDS_KV);
   return c.json({ config, bulkTiers: BULK_TIERS });
 });
@@ -1136,13 +1221,13 @@ app.put('/learned/config', async (c) => {
   if (!adminKey) {
     return c.json({ error: 'Admin key required' }, 401);
   }
-  
+
   if (!c.env.LEARNED_WORDS_KV) {
     return c.json({ error: 'Learning system not configured' }, 503);
   }
-  
+
   const updates = await c.req.json<Partial<LearningConfig>>();
-  
+
   // Validate config values
   if (updates.prThreshold !== undefined && (updates.prThreshold < 1 || updates.prThreshold > 10000)) {
     return c.json({ error: 'prThreshold must be between 1 and 10000' }, 400);
@@ -1150,7 +1235,7 @@ app.put('/learned/config', async (c) => {
   if (updates.maxBulkSize !== undefined && (updates.maxBulkSize < 10 || updates.maxBulkSize > 50000)) {
     return c.json({ error: 'maxBulkSize must be between 10 and 50000' }, 400);
   }
-  
+
   const config = await setLearningConfig(c.env.LEARNED_WORDS_KV, updates);
   return c.json({ config, message: 'Configuration updated' });
 });
@@ -1170,7 +1255,7 @@ app.post('/learned/bulk', async (c) => {
   if (!c.env.LEARNED_WORDS_KV) {
     return c.json({ error: 'Learning system not configured' }, 503);
   }
-  
+
   const body = await c.req.json<{
     words: Array<{ word: string; translations: Record<string, string>; pos?: string; confidence?: number }>;
     tier?: BulkTier;
@@ -1179,17 +1264,17 @@ app.post('/learned/bulk', async (c) => {
     skipDuplicates?: boolean;
     autoTriggerPR?: boolean;
   }>();
-  
+
   if (!body.words || !Array.isArray(body.words)) {
     return c.json({ error: 'words array required' }, 400);
   }
-  
+
   // Check tier permission (xlarge and unlimited require admin key)
   const tier = body.tier || 'medium';
   if ((tier === 'xlarge' || tier === 'unlimited') && !c.req.header('X-Admin-Key')) {
     return c.json({ error: `Tier '${tier}' requires admin authentication` }, 403);
   }
-  
+
   const result = await bulkUploadWords(c.env.LEARNED_WORDS_KV, body.words, {
     tier,
     source: 'bulk',
@@ -1197,7 +1282,7 @@ app.post('/learned/bulk', async (c) => {
     triggerPRThreshold: body.triggerPRThreshold,
     skipDuplicates: body.skipDuplicates,
   });
-  
+
   // Auto-trigger PR if enabled and threshold reached
   if (body.autoTriggerPR !== false && result.shouldTriggerPR && c.env.GITHUB_TOKEN) {
     const prResult = await triggerDictionaryPR(c.env, body.triggerPRThreshold);
@@ -1206,7 +1291,7 @@ app.post('/learned/bulk', async (c) => {
       pr: prResult,
     });
   }
-  
+
   return c.json(result);
 });
 
@@ -1235,7 +1320,7 @@ app.post('/learned/trigger-pr', async (c) => {
  * Trigger GitHub PR with pending learned words
  */
 async function triggerDictionaryPR(
-  env: Env, 
+  env: Env,
   maxWords?: number,
   minConfidence?: number,
   forceAll?: boolean
@@ -1254,10 +1339,10 @@ async function triggerDictionaryPR(
 
   // Filter to only high-confidence words (unless forceAll)
   const confidenceThreshold = minConfidence ?? config.minConfidence;
-  const readyWords = forceAll 
-    ? pending 
+  const readyWords = forceAll
+    ? pending
     : pending.filter(w => w.confidence >= confidenceThreshold || w.seenCount >= 3);
-  
+
   if (readyWords.length === 0) {
     return { success: false, error: `No words meet confidence threshold (${confidenceThreshold})` };
   }

@@ -31,6 +31,12 @@ id = "${KV_LEARNED_WORDS_ID}"
 binding = "CACHE_KV"
 id = "${KV_CACHE_ID}"
 
+[[env.production.d1_databases]]
+binding = "LINGUA_DB"
+database_name = "lingua-db"
+database_id = "${D1_LINGUA_DB_ID}"
+migrations_dir = "migrations"
+
 [env.testing]
 routes = [{ pattern = "lingua.testing.local/*", zone_name = "localhost" }]
 

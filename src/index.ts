@@ -820,7 +820,31 @@ app.all('/api/*', createApiProxyRoute());
 app.get('/favicon.ico', serveFaviconHono);
 
 // Cache version - increment to invalidate old cached translations
-const CACHE_VERSION = 'v2';
+const CACHE_VERSION = 'v3';
+
+/**
+ * Validate that an AI translation output is plausible.
+ * Rejects empty strings, whitespace-only, punctuation-only, and same-character
+ * runs (e.g. "¡¡¡¡¡¡") that LLMs sometimes hallucinate.
+ */
+function isValidTranslation(out: string | undefined | null, original: string): boolean {
+  if (!out) return false;
+  const trimmed = out.trim();
+  if (trimmed.length === 0) return false;
+  // Must contain at least one letter (any script)
+  if (!/\p{L}/u.test(trimmed)) return false;
+  // Reject runs of a single character (e.g. "¡¡¡¡¡")
+  if (trimmed.length >= 4 && /^(.)\1+$/u.test(trimmed)) return false;
+  // Reject if 80%+ of chars are the same single char
+  const first = trimmed[0];
+  const sameCount = [...trimmed].filter(ch => ch === first).length;
+  if (trimmed.length >= 6 && sameCount / trimmed.length >= 0.8) return false;
+  // Reject if output is a verbatim system-prompt leak
+  if (/professional translator|return only/i.test(trimmed)) return false;
+  // Reject if output is wildly longer than input (likely hallucination)
+  if (trimmed.length > Math.max(40, original.length * 6)) return false;
+  return true;
+}
 
 // ============ TRANSLATION ENDPOINTS ============
 
@@ -839,7 +863,7 @@ app.post('/translate', async (c) => {
 
     // Normalize inputs
     const normalizedText = text.trim().substring(0, 5000);
-    const cacheKey = `${CACHE_VERSION}:trans:${from}:${to}:${hashString(normalizedText)}`;
+    const cacheKey = `${CACHE_VERSION}:trans:${from}:${to}:${hashString(normalizedText.toLowerCase())}`;
 
     // 1. Check KV cache first (unless bypassed)
     if (!bypassCache) {
@@ -853,7 +877,12 @@ app.post('/translate', async (c) => {
     }
 
     // 2. Try dictionary-based translation for simple words/phrases
-    const words = normalizedText.toLowerCase().split(/\s+/).filter(w => w.length > 0);
+    // Strip surrounding punctuation per word so "Hello," → "hello" matches the dictionary
+    const words = normalizedText
+      .toLowerCase()
+      .split(/\s+/)
+      .map(w => w.replace(/^[^\p{L}]+|[^\p{L}]+$/gu, ''))
+      .filter(w => w.length > 0);
 
     // Check if ALL words are in dictionary (for short texts)
     if (words.length <= 10 && (from === 'en' || from === 'auto')) {
@@ -948,9 +977,12 @@ app.post('/translate', async (c) => {
         })),
       };
 
-      await c.env.CACHE_KV.put(cacheKey, JSON.stringify(result), {
-        expirationTtl: parseInt(c.env.CACHE_TTL_SECONDS) || 86400,
-      });
+      // Only cache if AI actually translated something (not the failure-fallback returning input verbatim)
+      if (translatedText.trim().toLowerCase() !== normalizedText.toLowerCase()) {
+        await c.env.CACHE_KV.put(cacheKey, JSON.stringify(result), {
+          expirationTtl: parseInt(c.env.CACHE_TTL_SECONDS) || 86400,
+        });
+      }
 
       return c.json(result, 200, {
         'X-Cache': 'MISS',
@@ -960,7 +992,6 @@ app.post('/translate', async (c) => {
 
     // 4. Call OpenAI for full translation
     const translation = await translateWithCF(c, normalizedText, from, to, context);
-
     // Build word data for the response
     const translatedWords = translation.split(/\s+/);
     const wordData = translatedWords.map((tw, i) => {
@@ -982,10 +1013,12 @@ app.post('/translate', async (c) => {
       words: wordData,
     };
 
-    // Cache the result
-    await c.env.CACHE_KV.put(cacheKey, JSON.stringify(result), {
-      expirationTtl: parseInt(c.env.CACHE_TTL_SECONDS) || 86400,
-    });
+    // Cache the result (skip if AI failed and returned input verbatim)
+    if (translation.trim().toLowerCase() !== normalizedText.toLowerCase()) {
+      await c.env.CACHE_KV.put(cacheKey, JSON.stringify(result), {
+        expirationTtl: parseInt(c.env.CACHE_TTL_SECONDS) || 86400,
+      });
+    }
 
     return c.json(result, 200, {
       'X-Cache': 'MISS',
@@ -1405,9 +1438,10 @@ async function translateWithCF(
       target_lang: targetLang,
     }) as { translated_text: string };
 
-    if (result?.translated_text) {
-      return result.translated_text;
+    if (isValidTranslation(result?.translated_text, text)) {
+      return result.translated_text.trim();
     }
+    console.warn('[CF-TRANSLATE] m2m100 returned invalid output, falling back to LLM:', JSON.stringify(result?.translated_text));
   } catch (err) {
     console.warn('[CF-TRANSLATE] m2m100 failed, falling back to LLM:', err);
   }
@@ -1438,9 +1472,10 @@ async function translateWithCFLLM(
       temperature: 0.3,
     }) as { response?: string };
 
-    if (result?.response) {
-      return result.response.trim();
+    if (isValidTranslation(result?.response, text)) {
+      return (result.response as string).trim();
     }
+    console.warn('[CF-LLM] Fast model returned invalid output, trying primary:', JSON.stringify(result?.response));
   } catch (err) {
     console.warn('[CF-LLM] Fast model failed, trying primary:', err);
   }
@@ -1455,7 +1490,12 @@ async function translateWithCFLLM(
     temperature: 0.3,
   }) as { response?: string };
 
-  return result?.response?.trim() || text;
+  if (isValidTranslation(result?.response, text)) {
+    return (result.response as string).trim();
+  }
+  console.warn('[CF-LLM] Primary model also returned invalid output:', JSON.stringify(result?.response));
+  // Final fallback: return original text rather than nonsense
+  return text;
 }
 
 /**
